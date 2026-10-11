@@ -16,6 +16,7 @@ SnapCalendar — 剪贴板截图 → 日程抽取 → 写入 macOS 日历
       → macOS 通知播报结果
 """
 import base64
+import fcntl
 import hashlib
 import json
 import re
@@ -24,6 +25,7 @@ import sys
 import threading
 import time
 import urllib.request
+import objc
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -793,7 +795,7 @@ def extract_events(png_bytes, cfg):
 # ---------------- 写入日历（EventKit） ----------------
 
 import EventKit  # noqa: E402
-from Foundation import NSDate, NSAutoreleasePool  # noqa: E402
+from Foundation import NSDate, NSAutoreleasePool, NSObject  # noqa: E402
 
 _STORE = None
 
@@ -1114,9 +1116,138 @@ def run_selftest(cfg):
     return True
 
 
+# ---------------- 全局快捷键（Quartz event tap，≤3 键可配） ----------------
+
+MOD_FLAGS = {"option": 0x00080000, "alt": 0x00080000,
+             "cmd": 0x00100000, "command": 0x00100000,
+             "ctrl": 0x00040000, "control": 0x00040000,
+             "shift": 0x00020000}
+MOD_GLYPH = {"option": "⌥", "alt": "⌥", "cmd": "⌘", "command": "⌘",
+             "ctrl": "⌃", "control": "⌃", "shift": "⇧"}
+KEYCODES = {"a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7,
+            "c": 8, "v": 9, "b": 11, "q": 12, "w": 13, "e": 14, "r": 15,
+            "y": 16, "t": 17, "u": 32, "i": 34, "o": 31, "p": 35, "l": 37,
+            "j": 38, "k": 40, "n": 45, "m": 46}
+
+_HOTKEY_TAP = None
+_HOTKEY_DESC = ""
+
+
+def parse_hotkey(spec):
+    """'option+s' → (keycode, 修饰键掩码, 显示文案)；非法返回 None。"""
+    parts = [p.strip().lower() for p in str(spec).split("+") if p.strip()]
+    if len(parts) < 2:
+        return None
+    key, mods = parts[-1], parts[:-1]
+    if key not in KEYCODES or any(m not in MOD_FLAGS for m in mods):
+        return None
+    mask = 0
+    for m in mods:
+        mask |= MOD_FLAGS[m]
+    desc = "".join(MOD_GLYPH[m] for m in mods) + key.upper()
+    return KEYCODES[key], mask, desc
+
+
+def setup_hotkey(cfg, prompt=True):
+    """注册全局快捷键：按下 → 调起原生区域截图进剪贴板。需要辅助功能授权。"""
+    global _HOTKEY_TAP, _HOTKEY_DESC
+    if _HOTKEY_TAP is not None:
+        return True
+    parsed = parse_hotkey(cfg.get("hotkey", "option+s"))
+    if parsed is None:
+        log(f"快捷键配置无效：{cfg.get('hotkey')!r}（格式如 option+s / cmd+shift+a）")
+        return False
+    keycode, mask, desc = parsed
+
+    from Quartz import (CGEventTapCreate, CGEventMaskBit, kCGEventKeyDown,
+                        kCGSessionEventTap, kCGHeadInsertEventTap,
+                        kCGEventTapOptionDefault, CFMachPortCreateRunLoopSource,
+                        CFRunLoopGetCurrent, CFRunLoopAddSource, kCFRunLoopCommonModes,
+                        CGEventGetIntegerValueField, kCGKeyboardEventKeycode,
+                        CGEventGetFlags, CGEventTapEnable)
+
+    def cb(proxy, etype, event, refcon):
+        try:
+            if CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode) == keycode \
+                    and (CGEventGetFlags(event) & 0xFF0000) == mask:
+                subprocess.Popen(["/usr/sbin/screencapture", "-i", "-c"])
+                return None  # 吞掉按键
+        except Exception as e:
+            log(f"快捷键触发异常：{e}")
+        return event
+
+    tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
+                           kCGEventTapOptionDefault,
+                           CGEventMaskBit(kCGEventKeyDown), cb, None)
+    if tap is None:
+        if prompt:
+            try:
+                from ApplicationServices import (AXIsProcessTrustedWithOptions,
+                                                 kAXTrustedCheckOptionPrompt)
+                AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True})
+                log("快捷键需要「辅助功能」授权：请在弹出的设置里打开「终端」开关")
+            except Exception as e:
+                log(f"快捷键注册失败：{e}")
+        return False
+    src = CFMachPortCreateRunLoopSource(None, tap, 0)
+    CFRunLoopAddSource(CFRunLoopGetCurrent(), src, kCFRunLoopCommonModes)
+    CGEventTapEnable(tap, True)
+    _HOTKEY_TAP = tap
+    _HOTKEY_DESC = desc
+    log(f"全局快捷键 {desc} 已注册：按下即框选截图进剪贴板")
+    notify("SnapCalendar", f"快捷键 {desc} 已启用")
+    return True
+
+
+class Poller(NSObject):
+    """定时轮询剪贴板 + 重试快捷键注册（事件循环托管给 NSApplication）。"""
+
+    def initWithState_(self, cfg_state):
+        self = objc.super(Poller, self).init()
+        if self is None:
+            return None
+        self.cfg, self.state = cfg_state
+        from AppKit import NSPasteboard
+        self.pb = NSPasteboard.generalPasteboard()
+        self.last_count = self.pb.changeCount()
+        self.hotkey_pending = False
+        self.hotkey_retry = 0
+        return self
+
+    def poll_(self, timer):
+        try:
+            if self.hotkey_pending:
+                self.hotkey_retry += 1
+                if setup_hotkey(self.cfg, prompt=False):
+                    self.hotkey_pending = False
+                elif self.hotkey_retry % 30 == 0:
+                    log("快捷键仍在等待「辅助功能」授权：系统设置 → 隐私与安全性 → 辅助功能 → 打开「终端」")
+            count = self.pb.changeCount()
+            if count != self.last_count:
+                self.last_count = count
+                png = read_clipboard_png(self.pb)
+                if png:
+                    handle_image(png, self.cfg, self.state)
+        except KeyboardInterrupt:
+            log("手动退出")
+            NSApplication.sharedApplication().terminate_(None)
+        except Exception as e:
+            log(f"[错误] {e}")
+            notify("SnapCalendar", f"处理失败：{e}")
+
+
 def main():
     cfg = load_config()
+
+    # 单实例锁：避免终端实例与开机自启实例双开
     STATE_DIR.mkdir(exist_ok=True)
+    lock_fp = open(STATE_DIR / "lock", "w")
+    try:
+        fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log("已有 SnapCalendar 实例在运行，本实例退出")
+        sys.exit(0)
+
     state = load_state()
 
     # 授权探测：EventKit 优先，失败退 AppleScript
@@ -1144,29 +1275,21 @@ def main():
             log("未找到可用的 LLM key（config.api_key 或 api_key_file），使用规则引擎")
 
     log(f"SnapCalendar 已启动：监控剪贴板 → 日历「{cfg['calendar_name']}」")
-    log("按 Ctrl+Cmd+Shift+4 框选截图即可识别写入")
-    notify("SnapCalendar", "已启动，监控剪贴板中（Ctrl+Cmd+Shift+4 截图即用）")
+    notify("SnapCalendar", "已启动：⌥S 截图即用（原生 Ctrl+Cmd+Shift+4 也可以）")
 
-    from AppKit import NSPasteboard
-    pb = NSPasteboard.generalPasteboard()
-    last_count = pb.changeCount()
-    while True:
-        pool = NSAutoreleasePool.alloc().init()
-        try:
-            count = pb.changeCount()
-            if count != last_count:
-                last_count = count
-                png = read_clipboard_png(pb)
-                if png:
-                    handle_image(png, cfg, state)
-        except KeyboardInterrupt:
-            log("手动退出")
-            break
-        except Exception as e:
-            log(f"[错误] {e}")
-            notify("SnapCalendar", f"处理失败：{e}")
-        del pool
-        time.sleep(cfg.get("poll_interval", 2))
+    # 事件循环：剪贴板轮询定时器 + 全局快捷键事件源都挂在主 runloop 上
+    from AppKit import NSApplication, NSTimer
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(1)  # NSApplicationActivationPolicyAccessory：不占 Dock
+    poller = Poller.alloc().initWithState_((cfg, state))
+    NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+        float(cfg.get("poll_interval", 2)), poller, "poll:", None, True)
+
+    if not setup_hotkey(cfg):
+        poller.hotkey_pending = True
+        log("快捷键暂未生效：等待辅助功能授权后自动注册（原生 Ctrl+Cmd+Shift+4 仍可用）")
+
+    app.run()
 
 
 if __name__ == "__main__":

@@ -4,8 +4,13 @@
   "api_key": "sk-在这里填入你的APIKEY",
   "api_key_file": "",
   "api_key_provider_hint": "zai",
-  "models": ["qwen-plus", "qwen-flash", "qwen-max"],
+  "models": [
+    "qwen-plus",
+    "qwen-flash",
+    "qwen-max"
+  ],
   "calendar_name": "来自聊天",
+  "hotkey": "option+s",
   "alarm_minutes": 15,
   "poll_interval": 2,
   "confidence_min": 0.5
