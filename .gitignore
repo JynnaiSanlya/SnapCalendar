@@ -1,0 +1,15 @@
+# 本地私密配置（含 API key），绝不入库
+config.local.json
+config.json
+
+# 运行数据（含消息 OCR 内容）
+state/
+
+# 虚拟环境与编译产物
+venv/
+__pycache__/
+*.pyc
+fm_extract
+
+# 系统
+.DS_Store
